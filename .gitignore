@@ -1,0 +1,8 @@
+# Exercise infrastructure — never push to public repo
+infra/
+attack/
+detection/
+setup.sh
+teardown.sh
+exercise-notes.md
+lab-params.json

